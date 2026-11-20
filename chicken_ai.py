@@ -6,6 +6,11 @@ import queue
 import threading
 import subprocess
 import tempfile
+import hashlib
+import secrets
+import webbrowser
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import math
 import random
 import base64
@@ -19,7 +24,7 @@ import customtkinter as ctk
 from PIL import Image, ImageTk
 
 APP_NAME = "Chicken AI"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 CHANNEL = "beta"
 GITHUB_REPO = "cezary-lonski/chicken-ai"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -301,6 +306,81 @@ def gemini_image(settings, prompt):
     with open(path, "wb") as f:
         f.write(img)
     return path, " ".join(text).strip()
+
+
+GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO = "https://openidconnect.googleapis.com/v1/userinfo"
+
+
+def google_login(client_id, client_secret, timeout=180, open_browser=webbrowser.open):
+    """Logowanie przez Google (OAuth 2.0, aplikacja na komputer, PKCE, przekierowanie na localhost).
+    Zwraca {"name", "email", "picture": bajty lub None}. Tokeny nie są nigdzie zapisywane."""
+    verifier = base64.urlsafe_b64encode(os.urandom(48)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    result = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if "code" in q or "error" in q:
+                result.update({k: v[0] for k, v in q.items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("<html><body style='font-family:Segoe UI,sans-serif;background:#191619;color:#f1ebe4;"
+                             "text-align:center;padding-top:90px'><h1>Chicken AI</h1>"
+                             "<p>Gotowe! Możesz zamknąć to okno i wrócić do aplikacji.</p></body></html>".encode("utf-8"))
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    redirect = f"http://127.0.0.1:{srv.server_address[1]}"
+    params = {"client_id": client_id, "redirect_uri": redirect, "response_type": "code",
+              "scope": "openid email profile", "code_challenge": challenge, "code_challenge_method": "S256",
+              "state": state, "prompt": "select_account"}
+    open_browser(GOOGLE_AUTH + "?" + urllib.parse.urlencode(params))
+    srv.timeout = 1
+    deadline = time.time() + timeout
+    try:
+        while not result and time.time() < deadline:
+            srv.handle_request()
+    finally:
+        srv.server_close()
+    if not result:
+        raise GeminiError("Upłynął czas na logowanie. Spróbuj ponownie.")
+    if result.get("state") != state:
+        raise GeminiError("Logowanie przerwane (niezgodny stan żądania).")
+    if "error" in result:
+        raise GeminiError("Google odmówił logowania: " + result["error"])
+    form = urllib.parse.urlencode({"code": result["code"], "client_id": client_id, "client_secret": client_secret,
+                                   "code_verifier": verifier, "redirect_uri": redirect,
+                                   "grant_type": "authorization_code"}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(GOOGLE_TOKEN, data=form, method="POST"), timeout=30) as r:
+            token = json.loads(r.read().decode("utf-8"))
+        req = urllib.request.Request(GOOGLE_USERINFO, headers={"Authorization": "Bearer " + token["access_token"]})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            info = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode("utf-8")).get("error_description") or str(e)
+        except Exception:
+            msg = str(e)
+        raise GeminiError("Google: " + msg)
+    except urllib.error.URLError as e:
+        raise GeminiError(f"Brak połączenia z internetem ({e.reason}).")
+    picture = None
+    if info.get("picture"):
+        try:
+            with urllib.request.urlopen(info["picture"], timeout=20) as r:
+                picture = r.read()
+        except Exception:
+            picture = None
+    return {"name": info.get("name") or info.get("email", "Użytkownik"), "email": info.get("email", ""),
+            "picture": picture}
 
 
 def gem_settings(s):
@@ -916,7 +996,7 @@ class App(ctk.CTk):
         self.img_user = self.make_user_icon()
         self.head_frames = self.make_head_frames()
 
-        defaults = {"temperature": 0.7, "max_tokens": 2048, "prompt": DEFAULT_PROMPT, "provider": "gemini", "persona": "klasyk", "xp": 0,
+        defaults = {"temperature": 0.7, "max_tokens": 2048, "prompt": DEFAULT_PROMPT, "provider": "gemini", "persona": "klasyk", "xp": 0, "google_client_id": "", "google_client_secret": "", "profile": None,
                     "image_model": DEFAULT_IMAGE_MODEL, "agent": False, "workdir": os.path.expanduser("~")}
         loaded = load_json(SETTINGS_FILE, {})
         self.settings = {**defaults, **loaded}
@@ -942,6 +1022,7 @@ class App(ctk.CTk):
         self.game = None
         self.active_tool = None
 
+        self.load_profile_icon()
         self.build_ui()
         self.new_chat()
         self.refresh_agent_ui()
@@ -1007,6 +1088,8 @@ class App(ctk.CTk):
                      text_color=C_TEXT, anchor="w").pack(fill="x", padx=14, pady=(10, 0))
         self.q_chicken = bottom
         self.bind("<Configure>", self.on_window_resize, add="+")
+        self.acct_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont("Segoe UI", 12), text_color=C_MUTED, anchor="w")
+        self.acct_lbl.pack(fill="x", padx=14, pady=(2, 0))
         self.lvl_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont("Segoe UI", 13, "bold"), text_color=C_ACCENT,
                                     anchor="w")
         self.lvl_lbl.pack(fill="x", padx=14, pady=(4, 2))
@@ -1084,6 +1167,7 @@ class App(ctk.CTk):
         self.input_frame = inp
         self.show_page("chat")
         self.refresh_level()
+        self.refresh_account()
 
     def build_chat_page(self, parent):
         page = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1187,6 +1271,30 @@ class App(ctk.CTk):
                       text_color=C_TEXT, command=self.reset_prompt).pack(side="left", padx=6)
         ctk.CTkButton(row, text="Zapisz", fg_color=C_ACCENT, hover_color=C_ACCENT_HOVER, text_color="#2a1f0c",
                       command=self.save_settings).pack(side="left")
+        a = ctk.CTkFrame(page, fg_color=C_BUBBLE, corner_radius=18)
+        a.grid(row=1, column=0, sticky="new", pady=(0, 16), padx=(0, 10))
+        a.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(a, text="Konto Google (opcjonalne)", font=lf, text_color=C_TEXT, anchor="w"
+                     ).grid(row=0, column=0, sticky="w", padx=20, pady=(18, 0))
+        self.acct_status = ctk.CTkLabel(a, text="", font=small, text_color=C_MUTED, anchor="w", justify="left",
+                                        wraplength=700)
+        self.acct_status.grid(row=1, column=0, sticky="w", padx=20, pady=(2, 8))
+        ctk.CTkLabel(a, text="Google Client ID (typ klienta OAuth: Aplikacja na komputer)", font=small,
+                     text_color=C_MUTED, anchor="w").grid(row=2, column=0, sticky="w", padx=20)
+        self.gid_entry = ctk.CTkEntry(a, fg_color="#3a363b", border_width=0, text_color=C_TEXT, height=36)
+        self.gid_entry.grid(row=3, column=0, sticky="ew", padx=20, pady=(2, 8))
+        self.gid_entry.insert(0, self.settings.get("google_client_id", ""))
+        ctk.CTkLabel(a, text="Google Client Secret (zapisywany tylko na tym komputerze)", font=small,
+                     text_color=C_MUTED, anchor="w").grid(row=4, column=0, sticky="w", padx=20)
+        self.gsec_entry = ctk.CTkEntry(a, show="•", fg_color="#3a363b", border_width=0, text_color=C_TEXT, height=36)
+        self.gsec_entry.grid(row=5, column=0, sticky="ew", padx=20, pady=(2, 10))
+        self.gsec_entry.insert(0, self.settings.get("google_client_secret", ""))
+        brow = ctk.CTkFrame(a, fg_color="transparent")
+        brow.grid(row=6, column=0, sticky="e", padx=20, pady=(0, 18))
+        ctk.CTkButton(brow, text="Wyloguj", fg_color="#3a363b", hover_color="#4a4548", text_color=C_TEXT,
+                      command=self.logout).pack(side="left", padx=6)
+        ctk.CTkButton(brow, text="Zaloguj przez Google", fg_color=C_ACCENT, hover_color=C_ACCENT_HOVER,
+                      text_color="#2a1f0c", command=self.google_login_click).pack(side="left")
         self.on_settings()
         return outer
 
@@ -1474,6 +1582,77 @@ class App(ctk.CTk):
     def set_input(self, enabled):
         # pole tekstowe zostaje aktywne, żeby dało się pisać gdy kurczak myśli (wiadomości trafiają do kolejki)
         self.agent_sw.configure(state="normal" if enabled else "disabled")
+
+    # ---------- konto Google ----------
+    def load_profile_icon(self):
+        pr = self.settings.get("profile")
+        self.img_user = None
+        if pr and pr.get("picture") and os.path.exists(pr["picture"]):
+            try:
+                from PIL import ImageDraw
+                im = Image.open(pr["picture"]).convert("RGBA")
+                side = min(im.size)
+                im = im.crop(((im.width - side) // 2, (im.height - side) // 2,
+                              (im.width + side) // 2, (im.height + side) // 2)).resize((200, 200), Image.LANCZOS)
+                mask = Image.new("L", (200, 200), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, 199, 199), fill=255)
+                im.putalpha(mask)
+                self.img_user = ctk.CTkImage(light_image=im, dark_image=im, size=(48, 48))
+            except Exception:
+                self.img_user = None
+        if self.img_user is None:
+            self.img_user = self.make_user_icon()
+
+    def refresh_account(self):
+        pr = self.settings.get("profile")
+        self.acct_lbl.configure(text=pr["name"] if pr else "Niezalogowany")
+        self.acct_status.configure(
+            text=f"Zalogowano jako {pr['name']} ({pr['email']})" if pr else
+            "Niezalogowany. Logowanie nie jest wymagane do korzystania z aplikacji. Client ID i Secret utworzysz w "
+            "Google Cloud Console (APIs & Services, Credentials, OAuth client ID, typ: Desktop app).")
+
+    def google_login_click(self):
+        cid, sec = self.gid_entry.get().strip(), self.gsec_entry.get().strip()
+        if not cid or not sec:
+            self.acct_status.configure(text="Wpisz Client ID i Client Secret z Google Cloud Console.")
+            return
+        self.settings["google_client_id"], self.settings["google_client_secret"] = cid, sec
+        save_json(SETTINGS_FILE, self.settings)
+        self.acct_status.configure(text="Otwieram przeglądarkę. Dokończ logowanie w jej oknie...")
+
+        def work():
+            try:
+                self.q.put(("login_ok", google_login(cid, sec)))
+            except Exception as e:
+                self.q.put(("login_err", str(e)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply_profile(self, prof):
+        path = None
+        if prof.get("picture"):
+            path = os.path.join(DATA_DIR, "avatar.png")
+            with open(path, "wb") as f:
+                f.write(prof["picture"])
+        self.settings["profile"] = {"name": prof["name"], "email": prof["email"], "picture": path}
+        save_json(SETTINGS_FILE, self.settings)
+        self.load_profile_icon()
+        self.refresh_account()
+        if not self.busy:
+            self.render_chat()
+
+    def logout(self):
+        pr = self.settings.get("profile")
+        if pr and pr.get("picture") and os.path.exists(pr["picture"]):
+            try:
+                os.remove(pr["picture"])
+            except OSError:
+                pass
+        self.settings["profile"] = None
+        save_json(SETTINGS_FILE, self.settings)
+        self.load_profile_icon()
+        self.refresh_account()
+        if not self.busy:
+            self.render_chat()
 
     # ---------- poziomy i XP ----------
     def level(self):
@@ -1849,6 +2028,10 @@ class App(ctk.CTk):
                     if self.queue:
                         qt, qi = self.queue.pop(0)
                         self.after(250, lambda qt=qt, qi=qi: self.start_send(qt, qi))
+                elif kind == "login_ok":
+                    self.apply_profile(val)
+                elif kind == "login_err":
+                    self.acct_status.configure(text="Logowanie nie powiodło się: " + val)
                 elif kind == "update":
                     self.update_info = val
                     tag = val[0]

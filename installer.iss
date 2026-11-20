@@ -1,4 +1,4 @@
-#define AppVer "0.3.0-beta"
+#define AppVer "0.4.0-beta"
 [Setup]
 AppId={{8E3B1C0A-5D7F-4B7E-9A55-C41C4E1C0A01}
 AppName=Chicken AI

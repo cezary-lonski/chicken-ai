@@ -23,6 +23,7 @@ Kurczakowy asystent AI w oknie (Windows). Działa na Gemini, Claude albo OpenAI,
 - **Mini gra Kurczak Łucznik:** w czasie rysowania obrazka chodzisz strzałkami i strzelasz z łuku do potworów (spacja).
 - **Tryb agenta:** czyta i zapisuje pliki oraz uruchamia komendy PowerShell w wybranym folderze. Zapis i komendy zawsze wymagają Twojej zgody.
 - **Czat:** odpowiedzi na żywo, zaznaczanie i kopiowanie wiadomości, możliwość pisania podczas myślenia (kolejka), historia z wyszukiwarką.
+- **Logowanie przez Google** (opcjonalne): własny Client ID i Secret z Google Cloud Console (typ: Desktop app), wpisywane w Ustawieniach. Pokazuje Twoje imię i zdjęcie w aplikacji; tokeny nie są zapisywane.
 - **Automatyczne aktualizacje** z GitHub Releases.
 
 ## Instalacja
