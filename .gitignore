@@ -1,0 +1,14 @@
+models/
+dist/
+build/
+installer_out/
+__pycache__/
+*.spec
+assets/_*
+assets/t_*
+assets/u_*
+assets/logo.png
+assets/big.png
+assets/avatar.png
+assets/question.png
+prep_assets.py
