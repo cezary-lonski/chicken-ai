@@ -5,6 +5,7 @@ Okienkowy asystent AI w stylu kurczaka, napędzany przez Google Gemini (Windows)
 ## Funkcje
 - Czat z odpowiedziami na żywo, animowana kręcąca się głowa kurczaka podczas myślenia
 - **Tryb agenta**: Gemini może wypisywać i czytać pliki, zapisywać pliki oraz uruchamiać komendy PowerShell w wybranym folderze. Zapis i komendy zawsze wymagają Twojej zgody.
+- **Generowanie obrazków** (przycisk "Obraz" lub komenda `/obraz opis`), zapis w ObrazyChickenAI
 - Historia rozmów, ustawienia (model, kreatywność, osobowość)
 - **Automatyczne aktualizacje** z GitHub Releases (instalator pobierany i uruchamiany po kliknięciu "Zaktualizuj")
 

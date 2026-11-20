@@ -6,6 +6,8 @@ import queue
 import threading
 import subprocess
 import tempfile
+import base64
+import datetime
 import urllib.request
 import urllib.error
 import tkinter as tk
@@ -15,11 +17,12 @@ import customtkinter as ctk
 from PIL import Image
 
 APP_NAME = "Chicken AI"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 CHANNEL = "beta"
 GITHUB_REPO = "cezary-lonski/chicken-ai"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-flash-latest"
+DEFAULT_IMAGE_MODEL = "gemini-2.5-flash-image"
 
 DEFAULT_PROMPT = (
     "Jesteś Chicken AI, przyjazny asystent w formie kurczaka. "
@@ -112,14 +115,17 @@ class GeminiError(Exception):
     pass
 
 
-def gemini_open(settings, contents, system, tools=None, stream=False):
+def gemini_open(settings, contents, system, tools=None, stream=False, model=None, modalities=None):
     key = settings.get("api_key", "").strip()
-    model = settings.get("model", "").strip() or DEFAULT_MODEL
+    model = model or settings.get("model", "").strip() or DEFAULT_MODEL
     body = {
-        "systemInstruction": {"parts": [{"text": system}]},
         "contents": contents,
         "generationConfig": {"temperature": settings["temperature"], "maxOutputTokens": settings["max_tokens"]},
     }
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+    if modalities:
+        body["generationConfig"]["responseModalities"] = modalities
     if tools:
         body["tools"] = [{"functionDeclarations": tools}]
     method = "streamGenerateContent?alt=sse" if stream else "generateContent"
@@ -167,6 +173,38 @@ def gemini_generate(settings, contents, system, tools=None):
         fb = data.get("promptFeedback", {}).get("blockReason")
         raise GeminiError(f"Gemini nie zwrócił odpowiedzi{' (' + fb + ')' if fb else ''}.")
     return cands[0].get("content", {"role": "model", "parts": []})
+
+
+def images_dir():
+    d = os.path.join(os.path.expanduser("~"), "Pictures", "ChickenAI")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def gemini_image(settings, prompt):
+    """Generuje obrazek; zwraca (sciezka_pliku, opis_tekstowy)."""
+    model = settings.get("image_model", "").strip() or DEFAULT_IMAGE_MODEL
+    contents = [{"role": "user", "parts": [{"text": prompt}]}]
+    with gemini_open(settings, contents, None, model=model, modalities=["TEXT", "IMAGE"]) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    cands = data.get("candidates") or []
+    if not cands:
+        fb = data.get("promptFeedback", {}).get("blockReason")
+        raise GeminiError(f"Gemini nie wygenerował obrazka{' (' + fb + ')' if fb else ''}.")
+    text, img = [], None
+    for part in cands[0].get("content", {}).get("parts", []):
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline and inline.get("data") and img is None:
+            img = base64.b64decode(inline["data"])
+        elif part.get("text"):
+            text.append(part["text"])
+    if img is None:
+        raise GeminiError("Model nie zwrócił obrazka. " + " ".join(text)[:200])
+    name = datetime.datetime.now().strftime("chicken_%Y%m%d_%H%M%S.png")
+    path = os.path.join(images_dir(), name)
+    with open(path, "wb") as f:
+        f.write(img)
+    return path, " ".join(text).strip()
 
 
 # ======================================================================
@@ -295,9 +333,10 @@ def download_installer(url):
 class Bubble(ctk.CTkFrame):
     """Jeden dymek (użytkownik po prawej, kurczak po lewej, narzędzie agenta - mały szary)."""
 
-    def __init__(self, master, role, text, avatar_img, user_icon):
+    def __init__(self, master, role, text, avatar_img, user_icon, image_path=None):
         super().__init__(master, fg_color="transparent")
         self.role = role
+        self.image_path = image_path
         if role == "tool":
             self.label = ctk.CTkLabel(
                 self, text=text, justify="left", anchor="w", wraplength=480, fg_color=C_TOOL,
@@ -318,6 +357,24 @@ class Bubble(ctk.CTkFrame):
             icon.grid(row=0, column=0, sticky="nw")
             self.label.grid(row=0, column=1, sticky="nw", padx=(8, 60))
             self.grid_columnconfigure(2, weight=1)
+            if image_path:
+                self.show_image(image_path)
+
+    def show_image(self, path):
+        try:
+            im = Image.open(path).convert("RGB")
+            w = min(420, im.width)
+            h = round(im.height * w / im.width)
+            ci = ctk.CTkImage(light_image=im, dark_image=im, size=(w, h))
+        except Exception:
+            self.label.configure(text=self.label.cget("text") + "\n(nie można otworzyć: " + path + ")")
+            return
+        lbl = ctk.CTkLabel(self, text="", image=ci, cursor="hand2", corner_radius=12)
+        lbl.grid(row=1, column=1, sticky="nw", padx=(8, 8), pady=(6, 0))
+        lbl.bind("<Button-1>", lambda e: os.startfile(path))
+        cap = ctk.CTkLabel(self, text="Kliknij obrazek, aby otworzyć. Zapisano w: " + path, text_color=C_MUTED,
+                           font=ctk.CTkFont("Segoe UI", 11), anchor="w", justify="left", wraplength=420)
+        cap.grid(row=2, column=1, sticky="nw", padx=(8, 8))
 
     def set_text(self, text):
         self.label.configure(text=text)
@@ -381,7 +438,7 @@ class App(ctk.CTk):
         self.head_frames = self.make_head_frames()
 
         defaults = {"temperature": 0.7, "max_tokens": 2048, "prompt": DEFAULT_PROMPT, "api_key": "",
-                    "model": DEFAULT_MODEL, "agent": False, "workdir": os.path.expanduser("~")}
+                    "model": DEFAULT_MODEL, "image_model": DEFAULT_IMAGE_MODEL, "agent": False, "workdir": os.path.expanduser("~")}
         self.settings = {**defaults, **load_json(SETTINGS_FILE, {})}
         self.chats = load_json(CHATS_FILE, [])
         self.current = None
@@ -508,10 +565,15 @@ class App(ctk.CTk):
                                   fg_color="transparent", text_color=C_TEXT, font=ctk.CTkFont("Segoe UI", 16))
         self.entry.grid(row=0, column=0, sticky="ew", padx=(22, 8), pady=8)
         self.entry.bind("<Return>", lambda e: self.send())
+        self.image_mode = False
+        self.img_btn = ctk.CTkButton(inp, text="Obraz", width=76, height=46, corner_radius=23, fg_color="#3a363b",
+                                     hover_color="#4a4548", text_color=C_TEXT,
+                                     font=ctk.CTkFont("Segoe UI", 14, "bold"), command=self.toggle_image_mode)
+        self.img_btn.grid(row=0, column=1, padx=(0, 6), pady=8)
         self.btn = ctk.CTkButton(inp, text="➤", width=54, height=46, corner_radius=23, fg_color=C_ACCENT,
                                  hover_color=C_ACCENT_HOVER, text_color="#2a1f0c",
                                  font=ctk.CTkFont("Segoe UI", 20, "bold"), command=self.send)
-        self.btn.grid(row=0, column=1, padx=(0, 8), pady=8)
+        self.btn.grid(row=0, column=2, padx=(0, 8), pady=8)
         self.input_frame = inp
         self.show_page("chat")
 
@@ -565,6 +627,11 @@ class App(ctk.CTk):
         self.model_entry = ctk.CTkEntry(f, fg_color="#3a363b", border_width=0, text_color=C_TEXT, height=38)
         self.model_entry.grid(row=4, column=0, sticky="ew", padx=20, pady=(4, 12))
         self.model_entry.insert(0, self.settings["model"])
+        ctk.CTkLabel(f, text="Model do obrazków (może wymagać płatnego planu Gemini)", font=lf, text_color=C_TEXT,
+                     anchor="w").grid(row=12, column=0, sticky="w", padx=20)
+        self.imodel_entry = ctk.CTkEntry(f, fg_color="#3a363b", border_width=0, text_color=C_TEXT, height=38)
+        self.imodel_entry.grid(row=13, column=0, sticky="ew", padx=20, pady=(4, 18))
+        self.imodel_entry.insert(0, self.settings["image_model"])
 
         self.temp_lbl = ctk.CTkLabel(f, text="", font=lf, text_color=C_TEXT, anchor="w")
         self.temp_lbl.grid(row=5, column=0, sticky="w", padx=20)
@@ -672,6 +739,7 @@ class App(ctk.CTk):
         self.settings.update({
             "api_key": self.key_entry.get().strip(),
             "model": self.model_entry.get().strip() or DEFAULT_MODEL,
+            "image_model": self.imodel_entry.get().strip() or DEFAULT_IMAGE_MODEL,
             "temperature": round(self.temp_sl.get(), 1),
             "max_tokens": int(self.tok_sl.get()),
             "prompt": self.prompt_box.get("1.0", "end").strip() or DEFAULT_PROMPT})
@@ -731,12 +799,12 @@ class App(ctk.CTk):
         self.bubbles = []
         self.add_bubble("assistant", WELCOME)
         for m in self.current["messages"]:
-            self.add_bubble(m["role"], m["content"])
+            self.add_bubble(m["role"], m["content"], m.get("image"))
         self.title_lbl.configure(text=self.current.get("title") or "Chicken AI")
         self.scroll_end()
 
-    def add_bubble(self, role, text):
-        b = Bubble(self.chat, role, text, self.img_avatar, self.img_user)
+    def add_bubble(self, role, text, image_path=None):
+        b = Bubble(self.chat, role, text, self.img_avatar, self.img_user, image_path)
         b.grid(row=len(self.bubbles) + (1 if self.thinking else 0), column=0, sticky="ew", pady=6, padx=(0, 10))
         b.set_wrap(self.wrap_width() if role != "tool" else max(240, self.wrap_width() - 40))
         self.bubbles.append(b)
@@ -785,10 +853,18 @@ class App(ctk.CTk):
     def set_status(self, text):
         self.status_lbl.configure(text=text)
 
+    def toggle_image_mode(self, value=None):
+        self.image_mode = (not self.image_mode) if value is None else value
+        self.img_btn.configure(fg_color=C_ACCENT if self.image_mode else "#3a363b",
+                               text_color="#2a1f0c" if self.image_mode else C_TEXT)
+        self.entry.configure(placeholder_text="Opisz obrazek, który mam narysować..." if self.image_mode
+                             else "Napisz wiadomość...")
+
     def set_input(self, enabled):
         st = "normal" if enabled else "disabled"
         self.entry.configure(state=st)
         self.btn.configure(state=st)
+        self.img_btn.configure(state=st)
         self.agent_sw.configure(state=st)
         if enabled:
             self.entry.focus_set()
@@ -805,6 +881,10 @@ class App(ctk.CTk):
             self.show_page("settings")
             return
         self.entry.delete(0, "end")
+        want_image = self.image_mode
+        if text.lower().startswith("/obraz "):
+            want_image, text = True, text[7:].strip()
+        self.toggle_image_mode(False)
         chat = self.current
         chat["messages"].append({"role": "user", "content": text})
         if not chat["title"]:
@@ -817,6 +897,11 @@ class App(ctk.CTk):
         self.set_input(False)
         self.stream_bubble = None
         self.stream_text = ""
+        if want_image:
+            self.show_thinking("Kurczak rysuje")
+            self.set_status("Rysuję...")
+            threading.Thread(target=self.generate_image, args=(text, dict(self.settings)), daemon=True).start()
+            return
         agent = self.settings["agent"]
         self.show_thinking("Agent pracuje" if agent else "Kurczak myśli")
         self.set_status("Agent pracuje..." if agent else "Myślę...")
@@ -847,6 +932,16 @@ class App(ctk.CTk):
             else:
                 for tok in gemini_stream_text(settings, contents, settings["prompt"]):
                     self.q.put(("token", tok))
+        except GeminiError as e:
+            self.q.put(("error", str(e)))
+        except Exception as e:
+            self.q.put(("error", f"Błąd: {e}"))
+        self.q.put(("done", None))
+
+    def generate_image(self, prompt, settings):
+        try:
+            path, caption = gemini_image(settings, prompt)
+            self.q.put(("image", (path, caption or "Proszę, oto Twój obrazek!")))
         except GeminiError as e:
             self.q.put(("error", str(e)))
         except Exception as e:
@@ -894,6 +989,11 @@ class App(ctk.CTk):
                         self.stream_bubble = self.add_bubble("assistant", "")
                     self.stream_bubble.set_text(self.stream_text)
                     self.scroll_end()
+                elif kind == "image":
+                    path, caption = val
+                    self.clear_thinking()
+                    self.add_bubble("assistant", caption, path)
+                    self.current["messages"].append({"role": "assistant", "content": caption, "image": path})
                 elif kind == "tool":
                     self.clear_thinking()
                     self.add_bubble("tool", val)
