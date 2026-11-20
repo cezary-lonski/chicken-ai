@@ -12,3 +12,5 @@ assets/big.png
 assets/avatar.png
 assets/question.png
 prep_assets.py
+assets/*.png
+!assets/*_t.png
