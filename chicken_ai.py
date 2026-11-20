@@ -17,12 +17,13 @@ import customtkinter as ctk
 from PIL import Image
 
 APP_NAME = "Chicken AI"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 CHANNEL = "beta"
 GITHUB_REPO = "cezary-lonski/chicken-ai"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-flash-latest"
 DEFAULT_IMAGE_MODEL = "gemini-2.5-flash-image"
+FALLBACK_MODEL = "gemini-flash-lite-latest"
 
 DEFAULT_PROMPT = (
     "Jesteś Chicken AI, przyjazny asystent w formie kurczaka. "
@@ -129,24 +130,41 @@ def gemini_open(settings, contents, system, tools=None, stream=False, model=None
     if tools:
         body["tools"] = [{"functionDeclarations": tools}]
     method = "streamGenerateContent?alt=sse" if stream else "generateContent"
-    url = f"{GEMINI_BASE}/models/{model}:{method}"
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"), method="POST",
-        headers={"Content-Type": "application/json", "x-goog-api-key": key})
-    try:
-        return urllib.request.urlopen(req, timeout=120)
-    except urllib.error.HTTPError as e:
-        try:
-            msg = json.loads(e.read().decode("utf-8"))["error"]["message"]
-        except Exception:
-            msg = str(e)
-        if e.code in (400, 401, 403) and "API key" in msg:
-            msg = "Nieprawidłowy klucz API Gemini. Sprawdź go w Ustawieniach."
-        elif e.code == 429:
-            msg = "Limit zapytań Gemini wyczerpany. Spróbuj za chwilę."
-        raise GeminiError(msg if msg.startswith(("Nieprawid", "Limit")) else f"Gemini: {msg}")
-    except urllib.error.URLError as e:
-        raise GeminiError(f"Brak połączenia z internetem ({e.reason}).")
+    data = json.dumps(body).encode("utf-8")
+    models = [model]
+    if not modalities and model != FALLBACK_MODEL:
+        models.append(FALLBACK_MODEL)  # awaryjnie lżejszy model, gdy główny jest przeciążony
+    last_code, last_msg = None, ""
+    for m in models:
+        req = urllib.request.Request(
+            f"{GEMINI_BASE}/models/{m}:{method}", data=data, method="POST",
+            headers={"Content-Type": "application/json", "x-goog-api-key": key})
+        for attempt in range(3):
+            try:
+                return urllib.request.urlopen(req, timeout=120)
+            except urllib.error.HTTPError as e:
+                try:
+                    last_msg = json.loads(e.read().decode("utf-8"))["error"]["message"]
+                except Exception:
+                    last_msg = str(e)
+                last_code = e.code
+                if e.code in (500, 502, 503, 504) and attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                break
+            except urllib.error.URLError as e:
+                raise GeminiError(f"Brak połączenia z internetem ({e.reason}).")
+        if last_code in (400, 401, 403) and "API key" in last_msg:
+            break  # zły klucz: fallback nic nie da
+    if last_code in (400, 401, 403) and "API key" in last_msg:
+        raise GeminiError("Nieprawidłowy klucz API Gemini. Sprawdź go w Ustawieniach.")
+    if last_code == 429:
+        raise GeminiError("Limit zapytań Gemini wyczerpany. Spróbuj za chwilę.")
+    if last_code in (500, 502, 503, 504):
+        raise GeminiError("Gemini jest chwilowo przeciążony. Spróbuj ponownie za moment.")
+    if last_code == 404:
+        raise GeminiError(f"Nie znaleziono modelu '{model}'. Zmień nazwę modelu w Ustawieniach.")
+    raise GeminiError(f"Gemini: {last_msg}")
 
 
 def gemini_stream_text(settings, contents, system):
