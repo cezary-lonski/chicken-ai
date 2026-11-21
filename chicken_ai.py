@@ -26,7 +26,7 @@ import customtkinter as ctk
 from PIL import Image, ImageTk
 
 APP_NAME = "Chicken AI"
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 CHANNEL = "beta"
 GITHUB_REPO = "cezary-lonski/chicken-ai"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -390,7 +390,7 @@ GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO = "https://openidconnect.googleapis.com/v1/userinfo"
 
 
-def google_login(client_id, client_secret, timeout=180, open_browser=webbrowser.open):
+def google_login(client_id, client_secret, timeout=180, open_browser=webbrowser.open, cancel=None):
     """Logowanie przez Google (OAuth 2.0, aplikacja na komputer, PKCE, przekierowanie na localhost).
     Zwraca {"name", "email", "picture": bajty lub None}. Tokeny nie są nigdzie zapisywane."""
     verifier = base64.urlsafe_b64encode(os.urandom(48)).rstrip(b"=").decode()
@@ -422,10 +422,12 @@ def google_login(client_id, client_secret, timeout=180, open_browser=webbrowser.
     srv.timeout = 1
     deadline = time.time() + timeout
     try:
-        while not result and time.time() < deadline:
+        while not result and time.time() < deadline and not (cancel and cancel.is_set()):
             srv.handle_request()
     finally:
         srv.server_close()
+    if cancel and cancel.is_set():
+        raise GeminiError("Logowanie anulowane.")
     if not result:
         raise GeminiError("Upłynął czas na logowanie. Spróbuj ponownie.")
     if result.get("state") != state:
@@ -1668,7 +1670,10 @@ class App(ctk.CTk):
             b.set_wrap(wrap if b.role != "tool" else max(240, wrap - 40))
 
     def scroll_end(self):
-        self.after(30, lambda: self.chat._parent_canvas.yview_moveto(1.0))
+        def go():
+            self.fix_scrollregion()
+            self.chat._parent_canvas.yview_moveto(1.0)
+        self.after(30, go)
 
     def show_thinking(self, text="Kurczak myśli"):
         self.clear_thinking()
@@ -1744,22 +1749,139 @@ class App(ctk.CTk):
                                      text_color="#2a1f0c")
         self.acct_status.configure(
             text=f"Zalogowano jako {pr['name']} ({pr['email']})" if pr else
-            "Niezalogowany. Logowanie nie jest wymagane do korzystania z aplikacji. Client ID i Secret utworzysz w "
-            "Google Cloud Console (APIs & Services, Credentials, OAuth client ID, typ: Desktop app).")
+            "Niezalogowany. Logowanie nie jest wymagane do korzystania z aplikacji. Zaloguj się e-mailem przyciskiem "
+            "w panelu bocznym albo kontem Google (wymaga Client ID i Secret z Google Cloud Console, typ: Desktop app).")
 
     def login_button(self):
         if self.settings.get("profile"):
             self.logout()
             return
-        cid = BUILTIN_GOOGLE_ID or self.settings.get("google_client_id", "")
-        sec = BUILTIN_GOOGLE_SECRET or self.settings.get("google_client_secret", "")
-        if not cid or not sec:
-            self.show_page("settings")
-            self.acct_status.configure(
-                text="Do pierwszego logowania wpisz tu Client ID i Client Secret z Google Cloud Console, potem kliknij "
-                     "\"Zaloguj przez Google\". Kolejne logowania to już jeden przycisk.")
+        self.open_email_dialog()
+
+    def open_email_dialog(self):
+        old = getattr(self, "email_dlg", None)
+        if old is not None and old.winfo_exists():
+            old.lift()
             return
+        d = self.email_dlg = ctk.CTkToplevel(self)
+        d.title("Zaloguj się")
+        d.configure(fg_color=C_MAIN)
+        d.resizable(False, False)
+        d.transient(self)
+        w, h = 460, 470
+        d.geometry(f"{w}x{h}+{self.winfo_rootx() + (self.winfo_width() - w) // 2}+{self.winfo_rooty() + 70}")
+        ctk.CTkLabel(d, text="", image=self.img_logo).pack(pady=(14, 0))
+        ctk.CTkLabel(d, text="Zaloguj się", font=ctk.CTkFont("Segoe UI", 20, "bold"), text_color=C_TEXT
+                     ).pack(pady=(6, 2))
+        d.msg = ctk.CTkLabel(d, text="Podaj imię i e-mail. Profil zapisuje się tylko na tym komputerze.",
+                             font=ctk.CTkFont("Segoe UI", 13), text_color=C_MUTED, wraplength=400)
+        d.msg.pack(padx=24, pady=(0, 8))
+        lf = ctk.CTkFont("Segoe UI", 11)
+        ctk.CTkLabel(d, text="Imię", font=lf, text_color=C_MUTED, anchor="w", width=400).pack()
+        d.name = ctk.CTkEntry(d, fg_color="#3a363b", border_width=0, text_color=C_TEXT, height=36, width=400)
+        d.name.pack(pady=(0, 6))
+        ctk.CTkLabel(d, text="E-mail", font=lf, text_color=C_MUTED, anchor="w", width=400).pack()
+        d.mail = ctk.CTkEntry(d, fg_color="#3a363b", border_width=0, text_color=C_TEXT, height=36, width=400)
+        d.mail.pack(pady=(0, 10))
+        d.mail.bind("<Return>", lambda e: self.email_login())
+        d.name.bind("<Return>", lambda e: d.mail.focus_set())
+        ctk.CTkButton(d, text="Zaloguj", height=40, corner_radius=20, fg_color=C_ACCENT, hover_color=C_ACCENT_HOVER,
+                      text_color="#2a1f0c", font=ctk.CTkFont("Segoe UI", 14, "bold"),
+                      command=self.email_login).pack(fill="x", padx=40, pady=(0, 6))
+        ctk.CTkButton(d, text="Zaloguj przez Google", height=34, corner_radius=17, fg_color="#3a363b",
+                      hover_color="#4a4548", text_color=C_TEXT, command=self.email_to_google).pack(fill="x", padx=40)
+        ctk.CTkButton(d, text="Anuluj", height=30, fg_color="transparent", hover_color="#2e2a2d", text_color=C_MUTED,
+                      command=d.destroy).pack(pady=(4, 0))
+        d.after(150, lambda: (d.lift(), d.focus_force(), d.name.focus_set()))
+
+    def email_login(self):
+        d = self.email_dlg
+        name, mail = d.name.get().strip(), d.mail.get().strip()
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", mail):
+            d.msg.configure(text="Podaj poprawny adres e-mail.", text_color=C_DANGER)
+            return
+        d.destroy()
+        self.apply_profile({"name": name or mail.split("@")[0], "email": mail, "picture": None})
+
+    def email_to_google(self):
+        self.email_dlg.destroy()
+        self.open_login_dialog()
+
+    def open_login_dialog(self):
+        old = getattr(self, "login_dlg", None)
+        if old is not None and old.winfo_exists():
+            old.lift()
+            return
+        d = self.login_dlg = ctk.CTkToplevel(self)
+        d.title("Zaloguj się przez Google")
+        d.configure(fg_color=C_MAIN)
+        d.resizable(False, False)
+        d.transient(self)
+        w, h = 460, 430
+        d.geometry(f"{w}x{h}+{self.winfo_rootx() + (self.winfo_width() - w) // 2}+{self.winfo_rooty() + 90}")
+        ctk.CTkLabel(d, text="", image=self.img_logo if hasattr(self, "img_logo") else None).pack(pady=(14, 0))
+        ctk.CTkLabel(d, text="Zaloguj się przez Google", font=ctk.CTkFont("Segoe UI", 20, "bold"),
+                     text_color=C_TEXT).pack(pady=(6, 2))
+        d.msg = ctk.CTkLabel(d, text="Kliknij przycisk, a w oknie przeglądarki wybierz swoje konto Google.",
+                             font=ctk.CTkFont("Segoe UI", 13), text_color=C_MUTED, wraplength=400, justify="center")
+        d.msg.pack(padx=24, pady=(0, 8))
+        builtin = bool(BUILTIN_GOOGLE_ID and BUILTIN_GOOGLE_SECRET)
+        d.gid = d.gsec = None
+        if not builtin:
+            ctk.CTkLabel(d, text="Jednorazowa konfiguracja: Client ID i Secret z Google Cloud Console "
+                                 "(typ: Aplikacja na komputer).", font=ctk.CTkFont("Segoe UI", 11),
+                         text_color=C_MUTED, wraplength=400).pack(padx=24)
+            ctk.CTkLabel(d, text="Client ID", font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
+                         anchor="w", width=400).pack(pady=(6, 0))
+            d.gid = ctk.CTkEntry(d, fg_color="#3a363b", border_width=0, text_color=C_TEXT, height=32, width=400)
+            d.gid.pack(pady=(0, 2))
+            ctk.CTkLabel(d, text="Client Secret", font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED,
+                         anchor="w", width=400).pack()
+            d.gsec = ctk.CTkEntry(d, show="•", fg_color="#3a363b", border_width=0, text_color=C_TEXT, height=32,
+                                  width=400)
+            d.gsec.pack(pady=(0, 4))
+            d.gid.insert(0, self.settings.get("google_client_id", ""))
+            d.gsec.insert(0, self.settings.get("google_client_secret", ""))
+        d.go = ctk.CTkButton(d, text="Wybierz konto Google", height=40, corner_radius=20, fg_color=C_ACCENT,
+                             hover_color=C_ACCENT_HOVER, text_color="#2a1f0c",
+                             font=ctk.CTkFont("Segoe UI", 14, "bold"), command=self.dialog_login)
+        d.go.pack(fill="x", padx=40, pady=(10, 6))
+        ctk.CTkButton(d, text="Anuluj", height=32, fg_color="transparent", hover_color="#2e2a2d",
+                      text_color=C_MUTED, command=self.close_login_dialog).pack()
+        d.protocol("WM_DELETE_WINDOW", self.close_login_dialog)
+        d.after(150, lambda: (d.lift(), d.focus_force()))
+        if builtin or (self.settings.get("google_client_id") and self.settings.get("google_client_secret")):
+            d.after(300, self.dialog_login)  # dane już są: od razu okno wyboru konta
+
+    def dialog_login(self):
+        d = getattr(self, "login_dlg", None)
+        if d is None or not d.winfo_exists():
+            return
+        if d.gid is not None:
+            cid, sec = d.gid.get().strip(), d.gsec.get().strip()
+            if not cid or not sec:
+                d.msg.configure(text="Wpisz Client ID i Client Secret.", text_color=C_DANGER)
+                return
+            self.settings["google_client_id"], self.settings["google_client_secret"] = cid, sec
+            self.gid_entry.delete(0, "end"); self.gid_entry.insert(0, cid)
+            self.gsec_entry.delete(0, "end"); self.gsec_entry.insert(0, sec)
+            save_json(SETTINGS_FILE, self.settings)
+        else:
+            cid, sec = BUILTIN_GOOGLE_ID, BUILTIN_GOOGLE_SECRET
+        d.go.configure(state="disabled", text="Czekam na wybór konta w przeglądarce...")
+        d.msg.configure(text="Otworzyło się okno przeglądarki. Wybierz konto Google i zatwierdź.", text_color=C_MUTED)
         self.begin_login(cid, sec)
+
+    def close_login_dialog(self):
+        ev = getattr(self, "login_cancel", None)
+        if ev is not None:
+            ev.set()
+        d = getattr(self, "login_dlg", None)
+        if d is not None and d.winfo_exists():
+            d.destroy()
+        self.login_dlg = None
+        self.login_btn.configure(state="normal")
+        self.refresh_account()
 
     def google_login_click(self):
         cid, sec = self.gid_entry.get().strip(), self.gsec_entry.get().strip()
@@ -1773,16 +1895,21 @@ class App(ctk.CTk):
     def begin_login(self, cid, sec):
         self.acct_status.configure(text="Otwieram przeglądarkę. Wybierz konto Google i dokończ logowanie...")
         self.login_btn.configure(text="Logowanie...", state="disabled")
+        self.login_cancel = cancel = threading.Event()
 
         def work():
             try:
-                self.q.put(("login_ok", google_login(cid, sec)))
+                self.q.put(("login_ok", google_login(cid, sec, cancel=cancel)))
             except Exception as e:
                 self.q.put(("login_err", str(e)))
         threading.Thread(target=work, daemon=True).start()
 
     def apply_profile(self, prof):
         self.login_btn.configure(state="normal")
+        d = getattr(self, "login_dlg", None)
+        if d is not None and d.winfo_exists():
+            d.destroy()
+        self.login_dlg = None
         path = None
         if prof.get("picture"):
             path = os.path.join(DATA_DIR, "avatar.png")
@@ -2190,8 +2317,21 @@ class App(ctk.CTk):
             contents.append({"role": "user", "parts": responses})
         self.emit(("token", "Przerwałem: osiągnięto limit kroków agenta."))
 
+    def fix_scrollregion(self):
+        """Obszar przewijania czatu nie zawsze nadąża za wysokimi dymkami, więc ustawiamy go ręcznie."""
+        try:
+            c = self.chat._parent_canvas
+            bb = c.bbox("all")
+            if bb and str(c.cget("scrollregion")) != " ".join(map(str, bb)):
+                c.configure(scrollregion=bb)
+        except Exception:
+            pass
+
     def poll(self):
         try:
+            self._tick = getattr(self, "_tick", 0) + 1
+            if self._tick % 5 == 0:
+                self.fix_scrollregion()
             self.update_ph()
             if self.busy and self.stream_bubble is None and getattr(self, "t_start", None):
                 n = int(time.time() - self.t_start)
@@ -2273,6 +2413,10 @@ class App(ctk.CTk):
                 elif kind == "login_ok":
                     self.apply_profile(val)
                 elif kind == "login_err":
+                    d = getattr(self, "login_dlg", None)
+                    if d is not None and d.winfo_exists():
+                        d.msg.configure(text="Logowanie nie powiodło się: " + val, text_color=C_DANGER)
+                        d.go.configure(state="normal", text="Spróbuj ponownie")
                     self.acct_status.configure(text="Logowanie nie powiodło się: " + val)
                     self.login_btn.configure(state="normal")
                     self.refresh_account()
