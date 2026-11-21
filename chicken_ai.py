@@ -6,6 +6,8 @@ import queue
 import threading
 import subprocess
 import tempfile
+import socket
+import re
 import hashlib
 import secrets
 import webbrowser
@@ -24,7 +26,7 @@ import customtkinter as ctk
 from PIL import Image, ImageTk
 
 APP_NAME = "Chicken AI"
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 CHANNEL = "beta"
 GITHUB_REPO = "cezary-lonski/chicken-ai"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -32,6 +34,12 @@ DEFAULT_MODEL = "gemini-flash-latest"
 DEFAULT_IMAGE_MODEL = "gemini-2.5-flash-image"
 FALLBACK_MODEL = "gemini-flash-lite-latest"
 PROVIDERS = {"gemini": "Gemini", "claude": "Claude", "openai": "OpenAI"}
+MODEL_PRESETS = {
+    "gemini": ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest", "gemini-2.5-flash",
+               "gemini-2.5-pro"],
+    "claude": ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-2"],
+    "openai": ["gpt-4o-mini", "gpt-4o", "gpt-4.1", "gpt-4.1-mini", "gpt-5"],
+}
 DEFAULT_MODELS = {"gemini": DEFAULT_MODEL, "claude": "claude-sonnet-5-5", "openai": "gpt-4o-mini"}
 CLAUDE_URL = "https://api.anthropic.com/v1/messages"
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
@@ -162,6 +170,20 @@ CHATS_FILE = os.path.join(DATA_DIR, "chats.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
 
+DEBUG_FILE = os.path.join(DATA_DIR, "debug.log")
+
+
+def dbg(msg):
+    """Krótki dziennik połączeń (bez kluczy API i treści rozmów) do diagnozowania zawieszeń."""
+    try:
+        if os.path.exists(DEBUG_FILE) and os.path.getsize(DEBUG_FILE) > 200_000:
+            os.remove(DEBUG_FILE)
+        with open(DEBUG_FILE, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    except Exception:
+        pass
+
+
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -203,7 +225,8 @@ class Stopped(Exception):
     pass
 
 
-def gemini_open(settings, contents, system, tools=None, stream=False, model=None, modalities=None):
+def gemini_open(settings, contents, system, tools=None, stream=False, model=None, modalities=None,
+                timeout=60, probe=False):
     key = settings.get("api_key", "").strip()
     model = model or settings.get("model", "").strip() or DEFAULT_MODEL
     body = {
@@ -228,25 +251,45 @@ def gemini_open(settings, contents, system, tools=None, stream=False, model=None
             headers={"Content-Type": "application/json", "x-goog-api-key": key})
         for attempt in range(3):
             try:
-                return urllib.request.urlopen(req, timeout=120)
+                t0 = time.time()
+                resp = urllib.request.urlopen(req, timeout=timeout)
+                dbg(f"{m} {method.split('?')[0]} HTTP 200 po {time.time() - t0:.1f}s")
+                return resp
+            except (TimeoutError, socket.timeout):
+                dbg(f"{m} {method.split('?')[0]} TIMEOUT {timeout}s")
+                if probe:
+                    raise GeminiError("timeout-probe")
+                last_code, last_msg = 504, "timeout"
+                break  # brak odpowiedzi: od razu lżejszy model zamiast kolejnej minuty czekania
             except urllib.error.HTTPError as e:
                 try:
                     last_msg = json.loads(e.read().decode("utf-8"))["error"]["message"]
                 except Exception:
                     last_msg = str(e)
                 last_code = e.code
+                dbg(f"{m} HTTP {e.code}: {last_msg[:150]}")
                 if e.code in (500, 502, 503, 504) and attempt < 2:
                     time.sleep(2 * (attempt + 1))
                     continue
                 break
             except urllib.error.URLError as e:
+                if isinstance(e.reason, (TimeoutError, socket.timeout)):
+                    dbg(f"{m} polaczenie TIMEOUT {timeout}s")
+                    if probe:
+                        raise GeminiError("timeout-probe")
+                    last_code, last_msg = 504, "timeout"
+                    break
                 raise GeminiError(f"Brak połączenia z internetem ({e.reason}).")
         if last_code in (400, 401, 403) and "API key" in last_msg:
             break  # zły klucz: fallback nic nie da
     if last_code in (400, 401, 403) and "API key" in last_msg:
         raise GeminiError("Nieprawidłowy klucz API Gemini. Sprawdź go w Ustawieniach.")
     if last_code == 429:
-        raise GeminiError("Limit zapytań Gemini wyczerpany. Spróbuj za chwilę.")
+        det = re.sub(r"\s+", " ", last_msg)[:220]
+        raise GeminiError("Limit Gemini wyczerpany dla tego modelu (darmowy klucz ma małe limity, obrazki często 0). "
+                          "Spróbuj za chwilę albo wybierz inny model. Szczegóły od Google: " + det)
+    if last_msg == "timeout":
+        raise GeminiError("Gemini nie odpowiada (brak reakcji przez 60 s). Spróbuj ponownie lub zmień model w Ustawieniach.")
     if last_code in (500, 502, 503, 504):
         raise GeminiError("Gemini jest chwilowo przeciążony. Spróbuj ponownie za moment.")
     if last_code == 404:
@@ -255,19 +298,45 @@ def gemini_open(settings, contents, system, tools=None, stream=False, model=None
 
 
 def gemini_stream_text(settings, contents, system):
-    with gemini_open(settings, contents, system, stream=True) as resp:
-        for raw in resp:
-            line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith("data:"):
-                continue
-            try:
-                data = json.loads(line[5:].strip())
-            except Exception:
-                continue
-            for cand in data.get("candidates", []):
-                for part in cand.get("content", {}).get("parts", []):
-                    if part.get("text") and not part.get("thought"):
-                        yield part["text"]
+    """Strumień SSE; gdy serwer nie zaczyna odpowiadać w 25 s lub strumień jest pusty, zwykłe zapytanie bez strumienia."""
+    got = False
+    t0 = time.time()
+    try:
+        with gemini_open(settings, contents, system, stream=True, timeout=25, probe=True) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    data = json.loads(line[5:].strip())
+                except Exception:
+                    continue
+                for cand in data.get("candidates", []):
+                    for part in cand.get("content", {}).get("parts", []):
+                        if part.get("text") and not part.get("thought"):
+                            if not got:
+                                dbg(f"pierwszy token po {time.time() - t0:.1f}s")
+                            got = True
+                            yield part["text"]
+        if got:
+            return
+        dbg("strumien pusty, ponawiam bez strumienia")
+    except (TimeoutError, socket.timeout):
+        if got:
+            raise GeminiError("Gemini przestał odpowiadać w trakcie odpowiedzi.")
+        dbg("strumien: timeout w trakcie odczytu, ponawiam bez strumienia")
+    except GeminiError as e:
+        if got or str(e) != "timeout-probe":
+            raise
+        dbg("strumien: brak odpowiedzi w 25s, ponawiam bez strumienia")
+    content = gemini_generate(settings, contents, system)
+    parts = content.get("parts", [])
+    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    dbg(f"bez strumienia: {len(text)} znakow po {time.time() - t0:.1f}s")
+    if not text:
+        raise GeminiError("Gemini zwrócił pustą odpowiedź (zablokowana lub cały limit długości zużyło 'myślenie'). "
+                          "Zwiększ długość odpowiedzi w Ustawieniach albo wybierz inny model.")
+    yield text
 
 
 def gemini_generate(settings, contents, system, tools=None):
@@ -312,6 +381,10 @@ def gemini_image(settings, prompt):
     return path, " ".join(text).strip()
 
 
+# Wbudowany klient OAuth (opcjonalnie): wklej tu Client ID i Secret typu "Aplikacja na komputer" z Google Cloud Console,
+# a każdy użytkownik zaloguje się samym przyciskiem, bez wpisywania czegokolwiek.
+BUILTIN_GOOGLE_ID = ""
+BUILTIN_GOOGLE_SECRET = ""
 GOOGLE_AUTH = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO = "https://openidconnect.googleapis.com/v1/userinfo"
@@ -1000,7 +1073,7 @@ class App(ctk.CTk):
         self.img_user = self.make_user_icon()
         self.head_frames = self.make_head_frames()
 
-        defaults = {"temperature": 0.7, "max_tokens": 2048, "prompt": DEFAULT_PROMPT, "provider": "gemini", "persona": "klasyk", "xp": 0, "google_client_id": "", "google_client_secret": "", "profile": None,
+        defaults = {"temperature": 0.7, "max_tokens": 2048, "prompt": DEFAULT_PROMPT, "provider": "gemini", "persona": "klasyk", "xp": 0,  "google_client_id": "", "google_client_secret": "", "profile": None,
                     "image_model": DEFAULT_IMAGE_MODEL, "agent": False, "workdir": os.path.expanduser("~")}
         loaded = load_json(SETTINGS_FILE, {})
         self.settings = {**defaults, **loaded}
@@ -1094,6 +1167,17 @@ class App(ctk.CTk):
         self.bind("<Configure>", self.on_window_resize, add="+")
         self.acct_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont("Segoe UI", 12), text_color=C_MUTED, anchor="w")
         self.acct_lbl.pack(fill="x", padx=14, pady=(2, 0))
+        self.login_btn = ctk.CTkButton(card, text="Zaloguj się przez Google", height=32, corner_radius=16,
+                                       fg_color=C_ACCENT, hover_color=C_ACCENT_HOVER, text_color="#2a1f0c",
+                                       font=ctk.CTkFont("Segoe UI", 13, "bold"), command=self.login_button)
+        self.login_btn.pack(fill="x", padx=14, pady=(4, 2))
+        self.lvl_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont("Segoe UI", 13, "bold"), text_color=C_ACCENT,
+                                    anchor="w")
+        self.lvl_lbl.pack(fill="x", padx=14, pady=(4, 2))
+        self.xp_bar = ctk.CTkProgressBar(card, height=8, progress_color=C_ACCENT, fg_color="#3a363b")
+        self.xp_bar.pack(fill="x", padx=14)
+        self.xp_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED, anchor="w")
+        self.xp_lbl.pack(fill="x", padx=14, pady=(2, 0))
         ctk.CTkLabel(card, text="Powered by pure chicken power", font=ctk.CTkFont("Segoe UI", 11),
                      text_color=C_MUTED, anchor="w").pack(fill="x", padx=14, pady=(0, 10))
 
@@ -1116,8 +1200,14 @@ class App(ctk.CTk):
                                       font=ctk.CTkFont("Segoe UI", 13), text_color=C_TEXT, command=self.toggle_agent)
         self.agent_sw.grid(row=0, column=2, padx=8)
         self.status_lbl = ctk.CTkLabel(top, text="", font=ctk.CTkFont("Segoe UI", 12), text_color=C_MUTED)
-        self.status_lbl.grid(row=0, column=3, padx=(18, 4))
-        ctk.CTkFrame(top, height=2, fg_color="#2a2629").grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        self.status_lbl.grid(row=0, column=4, padx=(18, 4))
+        self.model_menu = ctk.CTkOptionMenu(top, values=["-"], width=190, height=30, corner_radius=15,
+                                            fg_color="#2e2a2d", button_color="#3a3639", button_hover_color="#4a4548",
+                                            dropdown_fg_color="#2e2a2d", dropdown_hover_color="#3a3639",
+                                            text_color=C_TEXT, font=ctk.CTkFont("Segoe UI", 12),
+                                            command=self.pick_model)
+        self.model_menu.grid(row=0, column=3, padx=8)
+        ctk.CTkFrame(top, height=2, fg_color="#2a2629").grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 0))
 
         # pasek aktualizacji (ukryty do czasu znalezienia nowej wersji)
         self.upd_bar = ctk.CTkFrame(main, fg_color=C_SEL, corner_radius=12)
@@ -1167,6 +1257,7 @@ class App(ctk.CTk):
         self.show_page("chat")
         self.refresh_level()
         self.refresh_account()
+        self.refresh_model_menu()
 
     def build_chat_page(self, parent):
         page = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1266,6 +1357,8 @@ class App(ctk.CTk):
         self.prompt_box.insert("1.0", self.settings["prompt"])
         row = ctk.CTkFrame(f, fg_color="transparent")
         row.grid(row=11, column=0, sticky="e", padx=20, pady=(0, 18))
+        ctk.CTkButton(row, text="Sprawdź połączenie", fg_color="#3a3639", hover_color="#4a4548",
+                      text_color=C_TEXT, command=self.test_connection).pack(side="left", padx=6)
         ctk.CTkButton(row, text="Przywróć domyślną", fg_color="#3a3639", hover_color="#4a4548",
                       text_color=C_TEXT, command=self.reset_prompt).pack(side="left", padx=6)
         ctk.CTkButton(row, text="Zapisz", fg_color=C_ACCENT, hover_color=C_ACCENT_HOVER, text_color="#2a1f0c",
@@ -1415,6 +1508,7 @@ class App(ctk.CTk):
             "max_tokens": int(self.tok_sl.get()),
             "prompt": self.prompt_box.get("1.0", "end").strip() or DEFAULT_PROMPT})
         save_json(SETTINGS_FILE, self.settings)
+        self.refresh_model_menu()
         self.set_status("Zapisano ustawienia" if self.has_key() else "Brak klucza API")
         self.after(2500, lambda: self.set_status(self.ready_text() if self.has_key() and not self.busy else self.status_lbl.cget("text")))
 
@@ -1424,11 +1518,49 @@ class App(ctk.CTk):
         self.model_entry.delete(0, "end")
         self.model_entry.insert(0, self.model_tmp[self.cur_prov])
 
+    def refresh_model_menu(self):
+        prov = self.settings["provider"]
+        cur = self.settings["models"].get(prov) or DEFAULT_MODELS[prov]
+        vals = list(MODEL_PRESETS[prov])
+        if cur not in vals:
+            vals.insert(0, cur)
+        self.model_menu.configure(values=vals)
+        self.model_menu.set(cur)
+
+    def pick_model(self, name):
+        prov = self.settings["provider"]
+        self.settings["models"][prov] = name
+        if hasattr(self, "model_tmp"):
+            self.model_tmp[prov] = name
+            if self.cur_prov == prov:
+                self.model_entry.delete(0, "end")
+                self.model_entry.insert(0, name)
+        save_json(SETTINGS_FILE, self.settings)
+        self.set_status("Model: " + name)
+        self.after(2500, lambda: None if self.busy else self.set_status(self.ready_text()))
+
     def has_key(self):
         return bool(self.settings["keys"].get(self.settings["provider"]))
 
     def ready_text(self):
         return "Gotowy ● " + PROVIDERS[self.settings["provider"]] + " · " + persona_by_id(self.settings["persona"])["name"]
+
+    def test_connection(self):
+        self.save_settings()
+        if not self.has_key():
+            messagebox.showinfo("Test połączenia", "Najpierw wklej klucz API i zapisz.")
+            return
+        self.set_status("Testuję połączenie...")
+        st = dict(self.settings)
+
+        def work():
+            t = time.time()
+            try:
+                out = "".join(stream_text(st, [{"role": "user", "content": "Odpowiedz jednym słowem: ok"}], ""))
+                self.q.put(("conn", f"Działa! Model odpowiedział: {out.strip()[:80]} (po {time.time() - t:.1f} s)"))
+            except Exception as e:
+                self.q.put(("conn", f"Błąd po {time.time() - t:.1f} s:\n{e}"))
+        threading.Thread(target=work, daemon=True).start()
 
     def reset_prompt(self):
         self.prompt_box.delete("1.0", "end")
@@ -1605,10 +1737,29 @@ class App(ctk.CTk):
     def refresh_account(self):
         pr = self.settings.get("profile")
         self.acct_lbl.configure(text=pr["name"] if pr else "Niezalogowany")
+        if pr:
+            self.login_btn.configure(text="Wyloguj", fg_color="#3a363b", hover_color="#4a4548", text_color=C_TEXT)
+        else:
+            self.login_btn.configure(text="Zaloguj się przez Google", fg_color=C_ACCENT, hover_color=C_ACCENT_HOVER,
+                                     text_color="#2a1f0c")
         self.acct_status.configure(
             text=f"Zalogowano jako {pr['name']} ({pr['email']})" if pr else
             "Niezalogowany. Logowanie nie jest wymagane do korzystania z aplikacji. Client ID i Secret utworzysz w "
             "Google Cloud Console (APIs & Services, Credentials, OAuth client ID, typ: Desktop app).")
+
+    def login_button(self):
+        if self.settings.get("profile"):
+            self.logout()
+            return
+        cid = BUILTIN_GOOGLE_ID or self.settings.get("google_client_id", "")
+        sec = BUILTIN_GOOGLE_SECRET or self.settings.get("google_client_secret", "")
+        if not cid or not sec:
+            self.show_page("settings")
+            self.acct_status.configure(
+                text="Do pierwszego logowania wpisz tu Client ID i Client Secret z Google Cloud Console, potem kliknij "
+                     "\"Zaloguj przez Google\". Kolejne logowania to już jeden przycisk.")
+            return
+        self.begin_login(cid, sec)
 
     def google_login_click(self):
         cid, sec = self.gid_entry.get().strip(), self.gsec_entry.get().strip()
@@ -1617,7 +1768,11 @@ class App(ctk.CTk):
             return
         self.settings["google_client_id"], self.settings["google_client_secret"] = cid, sec
         save_json(SETTINGS_FILE, self.settings)
-        self.acct_status.configure(text="Otwieram przeglądarkę. Dokończ logowanie w jej oknie...")
+        self.begin_login(cid, sec)
+
+    def begin_login(self, cid, sec):
+        self.acct_status.configure(text="Otwieram przeglądarkę. Wybierz konto Google i dokończ logowanie...")
+        self.login_btn.configure(text="Logowanie...", state="disabled")
 
         def work():
             try:
@@ -1627,6 +1782,7 @@ class App(ctk.CTk):
         threading.Thread(target=work, daemon=True).start()
 
     def apply_profile(self, prof):
+        self.login_btn.configure(state="normal")
         path = None
         if prof.get("picture"):
             path = os.path.join(DATA_DIR, "avatar.png")
@@ -1658,7 +1814,12 @@ class App(ctk.CTk):
         return level_of(self.settings.get("xp", 0))
 
     def refresh_level(self):
-        pass
+        xp = self.settings.get("xp", 0)
+        lv = self.level()
+        lo, hi = xp_floor(lv), xp_floor(lv + 1)
+        self.lvl_lbl.configure(text=f"Poziom {lv} · {TITLES[min(lv, len(TITLES)) - 1]}")
+        self.xp_bar.set((xp - lo) / (hi - lo))
+        self.xp_lbl.configure(text=f"{xp - lo}/{hi - lo} XP do poziomu {lv + 1}")
 
     def add_xp(self, n):
         old = self.level()
@@ -1834,7 +1995,9 @@ class App(ctk.CTk):
         self.busy = True
         self.set_input(False)
         self.btn_state(True)
-        self.add_xp(5)
+        self.had_error = False
+        self.t_start = time.time()
+        self.did_agent = bool(self.settings.get("agent")) and not want_image
         self.stream_bubble = None
         self.stream_text = ""
         settings = dict(self.settings)
@@ -2030,6 +2193,12 @@ class App(ctk.CTk):
     def poll(self):
         try:
             self.update_ph()
+            if self.busy and self.stream_bubble is None and getattr(self, "t_start", None):
+                n = int(time.time() - self.t_start)
+                if n >= 3 and n != getattr(self, "_last_sec", -1):
+                    self._last_sec = n
+                    base = "Agent pracuje" if self.settings.get("agent") else "Myślę"
+                    self.set_status(f"{base}... {n} s (■ przerywa)")
             while True:
                 try:
                     kind, val = self.q.get_nowait()
@@ -2053,6 +2222,7 @@ class App(ctk.CTk):
         if True:
             if True:
                 if kind == "error":
+                    self.had_error = True
                     self.clear_thinking()
                     self.add_bubble("assistant", val)
                     self.current["messages"].append({"role": "assistant", "content": val})
@@ -2084,20 +2254,28 @@ class App(ctk.CTk):
                     ev.set()
                 elif kind == "done":
                     self.clear_thinking()
+                    ok_reply = bool(self.stream_text) and not self.had_error
                     if self.stream_text:
                         self.current["messages"].append({"role": "assistant", "content": self.stream_text})
                     save_json(CHATS_FILE, self.chats)
                     self.busy = False
                     self.btn_state(False)
+                    if ok_reply:
+                        self.add_xp(10 if self.did_agent else 5)
                     self.set_status(self.ready_text())
                     self.set_input(True)
                     if self.queue:
                         qt, qi = self.queue.pop(0)
                         self.after(250, lambda qt=qt, qi=qi: self.start_send(qt, qi))
+                elif kind == "conn":
+                    self.set_status(self.ready_text())
+                    messagebox.showinfo("Test połączenia", val)
                 elif kind == "login_ok":
                     self.apply_profile(val)
                 elif kind == "login_err":
                     self.acct_status.configure(text="Logowanie nie powiodło się: " + val)
+                    self.login_btn.configure(state="normal")
+                    self.refresh_account()
                 elif kind == "update":
                     self.update_info = val
                     tag = val[0]
