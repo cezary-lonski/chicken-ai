@@ -24,7 +24,7 @@ import customtkinter as ctk
 from PIL import Image, ImageTk
 
 APP_NAME = "Chicken AI"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 CHANNEL = "beta"
 GITHUB_REPO = "cezary-lonski/chicken-ai"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -196,6 +196,10 @@ def ctk_img(name, width=None, height=None):
 #  Gemini
 # ======================================================================
 class GeminiError(Exception):
+    pass
+
+
+class Stopped(Exception):
     pass
 
 
@@ -1090,13 +1094,6 @@ class App(ctk.CTk):
         self.bind("<Configure>", self.on_window_resize, add="+")
         self.acct_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont("Segoe UI", 12), text_color=C_MUTED, anchor="w")
         self.acct_lbl.pack(fill="x", padx=14, pady=(2, 0))
-        self.lvl_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont("Segoe UI", 13, "bold"), text_color=C_ACCENT,
-                                    anchor="w")
-        self.lvl_lbl.pack(fill="x", padx=14, pady=(4, 2))
-        self.xp_bar = ctk.CTkProgressBar(card, height=8, progress_color=C_ACCENT, fg_color="#3a363b")
-        self.xp_bar.pack(fill="x", padx=14)
-        self.xp_lbl = ctk.CTkLabel(card, text="", font=ctk.CTkFont("Segoe UI", 11), text_color=C_MUTED, anchor="w")
-        self.xp_lbl.pack(fill="x", padx=14, pady=(2, 0))
         ctk.CTkLabel(card, text="Powered by pure chicken power", font=ctk.CTkFont("Segoe UI", 11),
                      text_color=C_MUTED, anchor="w").pack(fill="x", padx=14, pady=(0, 10))
 
@@ -1165,6 +1162,8 @@ class App(ctk.CTk):
                                  font=ctk.CTkFont("Segoe UI", 20, "bold"), command=self.send)
         self.btn.grid(row=0, column=2, padx=(0, 8), pady=8)
         self.input_frame = inp
+        self.gen_id = 0
+        self.tl = threading.local()
         self.show_page("chat")
         self.refresh_level()
         self.refresh_account()
@@ -1659,12 +1658,7 @@ class App(ctk.CTk):
         return level_of(self.settings.get("xp", 0))
 
     def refresh_level(self):
-        xp = self.settings.get("xp", 0)
-        lv = self.level()
-        lo, hi = xp_floor(lv), xp_floor(lv + 1)
-        self.lvl_lbl.configure(text=f"Poziom {lv} · {TITLES[min(lv, len(TITLES)) - 1]}")
-        self.xp_bar.set((xp - lo) / (hi - lo))
-        self.xp_lbl.configure(text=f"{xp - lo}/{hi - lo} XP do poziomu {lv + 1}")
+        pass
 
     def add_xp(self, n):
         old = self.level()
@@ -1839,6 +1833,7 @@ class App(ctk.CTk):
         self.add_bubble("user", text)
         self.busy = True
         self.set_input(False)
+        self.btn_state(True)
         self.add_xp(5)
         self.stream_bubble = None
         self.stream_text = ""
@@ -1848,7 +1843,7 @@ class App(ctk.CTk):
             self.show_thinking("Kurczak rysuje")
             self.show_game()
             self.set_status("Rysuję... (zagraj w Kurczaka Łucznika!)")
-            threading.Thread(target=self.generate_image, args=(text, settings), daemon=True).start()
+            threading.Thread(target=self.generate_image, args=(text, settings, self.gen_id), daemon=True).start()
             return
         agent = settings["agent"]
         self.show_thinking("Agent pracuje" if agent else "Kurczak myśli")
@@ -1863,38 +1858,88 @@ class App(ctk.CTk):
                     history.append({"role": m["role"], "content": content})
         while history and history[0]["role"] != "user":
             history.pop(0)
-        threading.Thread(target=self.generate, args=(history, settings), daemon=True).start()
+        threading.Thread(target=self.generate, args=(history, settings, self.gen_id), daemon=True).start()
+
+    def emit(self, ev):
+        """Zdarzenie z wątku roboczego; przerywa wątek, jeśli użytkownik kliknął Zatrzymaj."""
+        if getattr(self.tl, "gid", None) != self.gen_id:
+            raise Stopped()
+        self.q.put(ev)
+
+    def stop_generation(self):
+        if not self.busy:
+            return
+        self.gen_id += 1  # stary wątek przerwie się przy następnym zdarzeniu
+        ev = getattr(self, "pending_confirm", None)
+        if ev:
+            ev[1]["ok"] = False
+            ev[0].set()
+        self.clear_thinking()
+        self.hide_game_if_any()
+        if self.stream_text:
+            self.current["messages"].append({"role": "assistant", "content": self.stream_text})
+        self.stream_bubble = None
+        self.stream_text = ""
+        save_json(CHATS_FILE, self.chats)
+        self.busy = False
+        self.set_status("Zatrzymano.")
+        self.set_input(True)
+        self.btn_state(False)
+        if self.queue:
+            qt, qi = self.queue.pop(0)
+            self.after(250, lambda qt=qt, qi=qi: self.start_send(qt, qi))
+
+    def hide_game_if_any(self):
+        try:
+            self.clear_thinking()
+        except Exception:
+            pass
+
+    def btn_state(self, running):
+        if running:
+            self.btn.configure(text="■", fg_color="#c0443a", hover_color="#d4574c", text_color="#ffffff",
+                               command=self.stop_generation)
+        else:
+            self.btn.configure(text="➤", fg_color=C_ACCENT, hover_color=C_ACCENT_HOVER, text_color="#2a1f0c",
+                               command=self.send)
 
     def ask_user(self, text):
         """Wołane z wątku roboczego: pyta o zgodę w głównym wątku."""
         ev = threading.Event()
         box = {}
-        self.q.put(("confirm", (text, ev, box)))
+        self.pending_confirm = (ev, box)
+        self.emit(("confirm", (text, ev, box)))
         ev.wait()
         return box.get("ok", False)
 
-    def generate(self, history, settings):
+    def generate(self, history, settings, gid):
+        self.tl.gid = gid
         try:
             if settings["agent"]:
                 self.run_agent(history, settings)
             else:
                 for tok in stream_text(settings, history, settings["prompt"]):
-                    self.q.put(("token", tok))
+                    self.emit(("token", tok))
+        except Stopped:
+            return
         except GeminiError as e:
-            self.q.put(("error", str(e)))
+            self.emit(("error", str(e)))
         except Exception as e:
-            self.q.put(("error", f"Błąd: {e}"))
-        self.q.put(("done", None))
+            self.emit(("error", f"Błąd: {e}"))
+        self.emit(("done", None))
 
-    def generate_image(self, prompt, settings):
+    def generate_image(self, prompt, settings, gid):
+        self.tl.gid = gid
         try:
             path, caption = make_image(settings, prompt)
-            self.q.put(("image", (path, caption or "Proszę, oto Twój obrazek!")))
+            self.emit(("image", (path, caption or "Proszę, oto Twój obrazek!")))
+        except Stopped:
+            return
         except GeminiError as e:
-            self.q.put(("error", str(e)))
+            self.emit(("error", str(e)))
         except Exception as e:
-            self.q.put(("error", f"Błąd: {e}"))
-        self.q.put(("done", None))
+            self.emit(("error", f"Błąd: {e}"))
+        self.emit(("done", None))
 
     def run_agent(self, history, settings):
         tools = AgentTools(settings["workdir"], self.ask_user)
@@ -1919,18 +1964,18 @@ class App(ctk.CTk):
             texts = [b["text"] for b in blocks if b.get("type") == "text" and b.get("text")]
             uses = [b for b in blocks if b.get("type") == "tool_use"]
             if not uses:
-                self.q.put(("token", "".join(texts) or "(brak odpowiedzi)"))
+                self.emit(("token", "".join(texts) or "(brak odpowiedzi)"))
                 return
             if texts:
-                self.q.put(("tool", " ".join(texts).strip()[:300]))
+                self.emit(("tool", " ".join(texts).strip()[:300]))
             msgs.append({"role": "assistant", "content": blocks})
             results = []
             for u in uses:
                 name, args = u["name"], u.get("input") or {}
-                self.q.put(("tool", "▸ " + tools.describe(name, args)))
+                self.emit(("tool", "▸ " + tools.describe(name, args)))
                 results.append({"type": "tool_result", "tool_use_id": u["id"], "content": tools.call(name, args)})
             msgs.append({"role": "user", "content": results})
-        self.q.put(("token", "Przerwałem: osiągnięto limit kroków agenta."))
+        self.emit(("token", "Przerwałem: osiągnięto limit kroków agenta."))
 
     def agent_openai(self, history, settings, tools, system):
         msgs = [{"role": "system", "content": system}] + [dict(m) for m in history]
@@ -1943,10 +1988,10 @@ class App(ctk.CTk):
             calls = msg.get("tool_calls") or []
             text = (msg.get("content") or "").strip()
             if not calls:
-                self.q.put(("token", text or "(brak odpowiedzi)"))
+                self.emit(("token", text or "(brak odpowiedzi)"))
                 return
             if text:
-                self.q.put(("tool", text[:300]))
+                self.emit(("tool", text[:300]))
             msgs.append({"role": "assistant", "content": msg.get("content"), "tool_calls": calls})
             for c in calls:
                 name = c["function"]["name"]
@@ -1954,9 +1999,9 @@ class App(ctk.CTk):
                     args = json.loads(c["function"].get("arguments") or "{}")
                 except Exception:
                     args = {}
-                self.q.put(("tool", "▸ " + tools.describe(name, args)))
+                self.emit(("tool", "▸ " + tools.describe(name, args)))
                 msgs.append({"role": "tool", "tool_call_id": c["id"], "content": tools.call(name, args)})
-        self.q.put(("token", "Przerwałem: osiągnięto limit kroków agenta."))
+        self.emit(("token", "Przerwałem: osiągnięto limit kroków agenta."))
 
     def agent_gemini(self, history, settings, tools, system):
         contents = to_gemini(history)
@@ -1967,26 +2012,46 @@ class App(ctk.CTk):
             calls = [p for p in parts if "functionCall" in p]
             texts = [p["text"] for p in parts if p.get("text") and not p.get("thought")]
             if not calls:
-                self.q.put(("token", "".join(texts) or "(brak odpowiedzi)"))
+                self.emit(("token", "".join(texts) or "(brak odpowiedzi)"))
                 return
             if texts:
-                self.q.put(("tool", " ".join(texts).strip()[:300]))
+                self.emit(("tool", " ".join(texts).strip()[:300]))
             contents.append({"role": "model", "parts": parts})
             responses = []
             for p in calls:
                 fc = p["functionCall"]
                 name, args = fc.get("name"), fc.get("args", {}) or {}
-                self.q.put(("tool", "▸ " + tools.describe(name, args)))
+                self.emit(("tool", "▸ " + tools.describe(name, args)))
                 result = tools.call(name, args)
                 responses.append({"functionResponse": {"name": name, "response": {"result": result}}})
             contents.append({"role": "user", "parts": responses})
-        self.q.put(("token", "Przerwałem: osiągnięto limit kroków agenta."))
+        self.emit(("token", "Przerwałem: osiągnięto limit kroków agenta."))
 
     def poll(self):
-        self.update_ph()
         try:
+            self.update_ph()
             while True:
-                kind, val = self.q.get_nowait()
+                try:
+                    kind, val = self.q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self.handle_event(kind, val)
+                except Exception as e:
+                    # błąd w obsłudze zdarzenia nie może zatrzymać pętli odbioru
+                    self.busy = False
+                    try:
+                        self.clear_thinking()
+                        self.set_input(True)
+                        self.set_status(f"Błąd interfejsu: {e}")
+                    except Exception:
+                        pass
+        finally:
+            self.after(40, self.poll)
+
+    def handle_event(self, kind, val):
+        if True:
+            if True:
                 if kind == "error":
                     self.clear_thinking()
                     self.add_bubble("assistant", val)
@@ -2023,6 +2088,7 @@ class App(ctk.CTk):
                         self.current["messages"].append({"role": "assistant", "content": self.stream_text})
                     save_json(CHATS_FILE, self.chats)
                     self.busy = False
+                    self.btn_state(False)
                     self.set_status(self.ready_text())
                     self.set_input(True)
                     if self.queue:
@@ -2041,9 +2107,6 @@ class App(ctk.CTk):
                     messagebox.showinfo("Aktualizacje", "Masz najnowszą wersję Chicken AI.")
                 elif kind == "update_err":
                     messagebox.showwarning("Aktualizacje", f"Nie udało się sprawdzić aktualizacji:\n{val}")
-        except queue.Empty:
-            pass
-        self.after(40, self.poll)
 
     # ---------- aktualizacje ----------
     def update_worker(self, manual=False):
